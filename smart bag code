@@ -1,0 +1,276 @@
+#include <WiFi.h>
+#include <Adafruit_MQTT.h>
+#include <Adafruit_MQTT_Client.h>
+
+#include <Wire.h>
+#include <MAX30105.h>
+#include "heartRate.h"
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+
+// NOTE: Put your WiFi SSID, Password, Adafruit IO Username and Key in a separate config.h file and include here
+// #include "config.h"
+
+// --- Global Variables for Adafruit IO ---
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, "io.adafruit.com", 1883, "Your_Username", "Your_AIO_Key");
+
+Adafruit_MQTT_Publish rfidStatusFeed = Adafruit_MQTT_Publish(&mqtt, "Your_Username/feeds/bag-rfid-status");
+Adafruit_MQTT_Publish gpsLocationFeed = Adafruit_MQTT_Publish(&mqtt, "Your_Username/feeds/bag-location");
+Adafruit_MQTT_Publish heartRateFeed = Adafruit_MQTT_Publish(&mqtt, "Your_Username/feeds/bag-heart-rate");
+Adafruit_MQTT_Publish temperatureFeed = Adafruit_MQTT_Publish(&mqtt, "Your_Username/feeds/bag-temperature");
+
+Adafruit_MQTT_Subscribe buzzerButton = Adafruit_MQTT_Subscribe(&mqtt, "Your_Username/feeds/buzzer-button");
+
+// --- Sensor Objects ---
+MAX30105 maxSensor;
+TinyGPSPlus gps;
+
+// UARTs
+HardwareSerial GPS(1);  // RX=GPIO16, TX=GPIO17
+HardwareSerial RFID(2); // RX=GPIO4, TX not used
+
+const int buzzerPin = 23;
+
+const char* validCard = "47004880931C";
+char card_no[13];
+int count = 0;
+bool invalidBeep = false;
+bool lastRFIDAuthorized = false;
+
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE] = {0};
+byte rateSpot = 0;
+long lastBeat = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+bool simulateHeartbeat = true;
+const int SIM_UPDATE_INTERVAL = 5000;
+const int BPM_MIN = 60;
+const int BPM_MAX = 100;
+const float NORMAL_TEMP = 37.0;
+const float BPM_TEMP_SENSITIVITY = 2.0;
+const long NO_FINGER_IR_THRESHOLD = 4000;
+const long MAX_IR_VALUE_FOR_MAPPING = 65536;
+const int BPM_IR_BASE_MIN = 65;
+const int BPM_IR_BASE_MAX = 75;
+
+const unsigned long PUBLISH_INTERVAL = 120000;
+unsigned long READ_PRINT_INTERVAL = 2000;
+
+unsigned long lastPublishTime = 0;
+unsigned long lastReadPrintTime = 0;
+
+
+void connectWiFi();
+void connectMQTT();
+void readRFID();
+void readGPS(bool publishData);
+void readHeartSensor(bool publishData);
+void handleBuzzerControl();
+
+void setup() {
+  Serial.begin(115200);
+
+  connectWiFi();
+
+  RFID.begin(9600, SERIAL_8N1, 4, -1);
+
+  GPS.begin(9600, SERIAL_8N1, 16, 17);
+
+  if (!maxSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("ERROR: MAX30105 sensor not found!");
+    while (1);
+  }
+  maxSensor.setup();
+  maxSensor.setPulseAmplitudeRed(0xFF);
+  maxSensor.setPulseAmplitudeGreen(0);
+  maxSensor.enableDIETEMPRDY();
+
+  if (simulateHeartbeat) {
+    randomSeed(analogRead(0));
+  }
+
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+
+  mqtt.subscribe(&buzzerButton);
+
+  Serial.println("Setup complete.");
+}
+
+void loop() {
+  if (!mqtt.connected()) {
+    connectMQTT();
+    if (!mqtt.connected()) {
+      delay(5000);
+      return;
+    }
+  }
+
+  mqtt.processPackets(10);
+
+  handleBuzzerControl();
+
+  readRFID();
+
+  if (millis() - lastReadPrintTime >= READ_PRINT_INTERVAL) {
+    lastReadPrintTime = millis();
+    readGPS(false);
+    readHeartSensor(false);
+  }
+
+  if (millis() - lastPublishTime >= PUBLISH_INTERVAL) {
+    lastPublishTime = millis();
+    readGPS(true);
+    readHeartSensor(true);
+  }
+
+  delay(100);
+}
+
+void connectWiFi() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin("Your_SSID", "Your_Pass");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("Connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMQTT() {
+  if (mqtt.connected()) return;
+
+  Serial.print("Connecting to Adafruit IO...");
+  uint8_t retries = 3;
+  int8_t ret;
+  while ((ret = mqtt.connect()) != 0 && retries > 0) {
+    Serial.println(mqtt.connectErrorString(ret));
+    mqtt.disconnect();
+    delay(5000);
+    retries--;
+  }
+  if (mqtt.connected()) {
+    Serial.println("Connected!");
+  } else {
+    Serial.println("Failed to connect.");
+  }
+}
+
+void readRFID() {
+  bool currentRFIDAuthorized = lastRFIDAuthorized;
+
+  if (RFID.available()) {
+    count = 0;
+    while (RFID.available() && count < 12) {
+      char c = RFID.read();
+      if (c == '\n' || c == '\r') break;
+      card_no[count++] = c;
+    }
+    card_no[count] = '\0';
+
+    if (String(card_no) == validCard) {
+      tone(buzzerPin, 2000, 100);
+      invalidBeep = false;
+      currentRFIDAuthorized = true;
+    } else {
+      tone(buzzerPin, 1000);
+      invalidBeep = true;
+      currentRFIDAuthorized = false;
+    }
+
+    if (mqtt.connected() && currentRFIDAuthorized != lastRFIDAuthorized) {
+      if (currentRFIDAuthorized) {
+        rfidStatusFeed.publish("Authorized");
+      } else {
+        rfidStatusFeed.publish("Unauthorized");
+      }
+      lastRFIDAuthorized = currentRFIDAuthorized;
+    }
+  }
+
+  if (invalidBeep && String(card_no) == validCard) {
+    noTone(buzzerPin);
+    invalidBeep = false;
+  }
+}
+
+void readGPS(bool publishData) {
+  while (GPS.available()) {
+    gps.encode(GPS.read());
+  }
+
+  if (gps.location.isValid()) {
+    if (publishData && mqtt.connected()) {
+      float altitude_meters = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+      char location_str[50];
+      sprintf(location_str, "%.6f,%.6f,%.2f", gps.location.lat(), gps.location.lng(), altitude_meters);
+      gpsLocationFeed.publish(location_str);
+    }
+  }
+}
+
+void readHeartSensor(bool publishData) {
+  long irValue = maxSensor.getIR();
+  float tempC = maxSensor.readTemperature();
+
+  if (irValue < NO_FINGER_IR_THRESHOLD) {
+    beatsPerMinute = 0;
+    beatAvg = 0;
+  } else if (simulateHeartbeat) {
+    float irNormalized = (float)(irValue - NO_FINGER_IR_THRESHOLD) / (MAX_IR_VALUE_FOR_MAPPING - NO_FINGER_IR_THRESHOLD);
+    irNormalized = constrain(irNormalized, 0.0, 1.0);
+    float irBaseBPM = BPM_IR_BASE_MIN + (irNormalized * (BPM_IR_BASE_MAX - BPM_IR_BASE_MIN));
+    float tempInfluence = (tempC - NORMAL_TEMP) * BPM_TEMP_SENSITIVITY;
+    float combinedBPM = irBaseBPM + tempInfluence + random(-100, 101) / 100.0;
+    beatsPerMinute = constrain(combinedBPM, BPM_MIN, BPM_MAX);
+    beatAvg = (int)beatsPerMinute;
+  } else {
+    bool beatDetected = checkForBeat(irValue);
+    if (beatDetected) {
+      long delta = millis() - lastBeat;
+      lastBeat = millis();
+      beatsPerMinute = 60 / (delta / 1000.0);
+      if (beatsPerMinute < 255 && beatsPerMinute > 20) {
+        rates[rateSpot++] = (byte)beatsPerMinute;
+        rateSpot %= RATE_SIZE;
+        beatAvg = 0;
+        for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+        beatAvg /= RATE_SIZE;
+      }
+    }
+  }
+
+  if (beatAvg > 0) {
+    if (publishData && mqtt.connected()) {
+      heartRateFeed.publish(beatAvg);
+    }
+  } else {
+    if (publishData && mqtt.connected()) {
+      heartRateFeed.publish(0);
+    }
+  }
+
+  if (publishData && mqtt.connected()) {
+    temperatureFeed.publish(tempC);
+  }
+}
+
+void handleBuzzerControl() {
+  Adafruit_MQTT_Subscribe *subscription;
+  while ((subscription = mqtt.readSubscription(1000))) {
+    if (subscription == &buzzerButton) {
+      String value = (char *)buzzerButton.lastread;
+      value.trim();
+      if (value == "ON" || value == "1") {
+        digitalWrite(buzzerPin, HIGH);
+      } else if (value == "OFF" || value == "0") {
+        digitalWrite(buzzerPin, LOW);
+      }
+    }
+  }
+}
